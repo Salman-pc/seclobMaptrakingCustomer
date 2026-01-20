@@ -1,11 +1,37 @@
 import { useState, useEffect } from 'react';
-import { TrackingMap } from './TrackingMap';
+import { MapContainer, TileLayer, Marker, Popup, Polyline } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import L from 'leaflet';
 import { useSocket } from '../hooks/useSocket';
 import { calculateDistance, calculateETA } from '../utils/tracking';
 import SendLocationButton from './SendLocationbutton';
 import { getMyAdressApi, userBookedServiceApi } from '../api/api';
 import { Link, useNavigate, useParams } from "react-router-dom";
 
+
+// Fix for default markers
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
+});
+
+// Customer marker icon
+const customerIcon = L.divIcon({
+  className: 'custom-customer-marker',
+  html: `
+    <div style="position: relative; width: 30px; height: 40px;">
+      <div style="width: 30px; height: 38px; background: linear-gradient(135deg, #a78bfa 0%, #7c3aed 100%); border-radius: 50% 50% 50% 0; transform: rotate(-45deg); box-shadow: 0 3px 10px rgba(124, 58, 237, 0.5); display: flex; align-items: center; justify-content: center; border: 2px solid white; position: absolute; top: 0; left: 0;">
+        <svg style="width: 12px; height: 12px; transform: rotate(45deg);" fill="white" viewBox="0 0 20 20">
+          <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>
+        </svg>
+      </div>
+    </div>
+  `,
+  iconSize: [30, 40],
+  iconAnchor: [15, 40],
+});
 
 const CustomerView = ({ tripId }) => {
   const socket = useSocket();
@@ -22,23 +48,34 @@ const CustomerView = ({ tripId }) => {
   const [locationError, setLocationError] = useState(null);
   const [rideTime, setRideTime] = useState(0);
 
+  const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
+  const [startTime, setStartTime] = useState(null);
+
   const [bookings, setBookings] = useState([]);
   const [lastRouteFetch, setLastRouteFetch] = useState(0);
+  const [waitingForProvider, setWaitingForProvider] = useState(true);
+  const [providerTimeout, setProviderTimeout] = useState(false);
+  const [notes, setNotes] = useState('');
+  const [showNotes, setShowNotes] = useState(false);
+  const [actualTripId, setActualTripId] = useState(null);
 
   useEffect(() => {
     // Set fixed customer location
-    setCustomerLocation([11.838993, 75.568532]);
+    setCustomerLocation([15.838993, 73.568532]);
 
     const getBookedService = async () => {
       if (id) {
         try {
           const result = await userBookedServiceApi(id);
           setBookings(result.bookings);
-          console.log();
+          console.log(result, "booked service result");
 
-          setCustomerLocation([result?.bookings[0]?.lat, result?.bookings[0]?.lon]);
-
-          console.log(result?.bookings[0]?.lat, result?.bookings[0]?.lon, "booked serviceggggg");
+          const booking = result?.bookings[0];
+          if (booking) {
+            setActualTripId(booking._id);
+            setCustomerLocation([booking.lat, booking.lon]);
+            console.log('Trip ID:', booking._id, 'Customer location:', booking.lat, booking.lon);
+          }
         } catch (error) {
           console.log(error);
         }
@@ -46,7 +83,6 @@ const CustomerView = ({ tripId }) => {
     };
 
     getBookedService();
-    console.log('✅ CUSTOMER: Fixed location set - Lat: 11.838993, Lng: 75.568532');
   }, [id]);
 
   useEffect(() => {
@@ -54,6 +90,11 @@ const CustomerView = ({ tripId }) => {
       getRoadRoute(providerLocation[0], providerLocation[1], customerLocation[0], customerLocation[1]);
     }
   }, [providerLocation, customerLocation]);
+
+  const handleRouteSelect = (index) => {
+    setSelectedRouteIndex(index);
+    setRoadRoute(alternativeRoutes[index]);
+  };
 
   const getRoadRoute = async (startLat, startLng, endLat, endLng) => {
     const now = Date.now();
@@ -93,8 +134,22 @@ const CustomerView = ({ tripId }) => {
       return;
     }
 
-    console.log('👤 CUSTOMER: Joining trip:', id);
-    socket.emit('customer:join', id);
+    console.log('👤 CUSTOMER: Joining trip with ID:', actualTripId || id);
+    socket.emit('customer:join', actualTripId || id);
+    
+    // Request current provider location
+    setTimeout(() => {
+      socket.emit('request:provider:location', actualTripId || id);
+      console.log('📍 CUSTOMER: Requested provider location for trip:', actualTripId || id);
+    }, 1000);
+
+    // Debug: Listen for any events
+    const originalEmit = socket.emit;
+    const originalOn = socket.on;
+    
+    socket.onAny((eventName, ...args) => {
+      console.log('🔊 CUSTOMER: Received event:', eventName, args);
+    });
 
     socket.on('trip:data', (data) => {
       console.log('✅ CUSTOMER: Trip data received:', data);
@@ -102,29 +157,43 @@ const CustomerView = ({ tripId }) => {
     });
 
     socket.on('location:update', (data) => {
-      console.log('📍 CUSTOMER: Provider location update - Lat:', data.lat, 'Lng:', data.lng);
-      const newPos = [data.lat, data.lng];
-
-      setProviderLocation(newPos);
-      
-      if (customerLocation) {
-        const dist = calculateDistance(data.lat, data.lng, customerLocation[0], customerLocation[1]);
-        setDistance(dist);
-        setEta(calculateETA(dist));
-        getRoadRoute(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+      console.log('📍 CUSTOMER: Provider location update received:', JSON.stringify(data));
+      if (data && data.lat && data.lng) {
+        const newPos = [data.lat, data.lng];
+        setProviderLocation(newPos);
+        setWaitingForProvider(false);
+        setProviderTimeout(false);
+        
+        if (customerLocation) {
+          const dist = calculateDistance(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+          setDistance(dist);
+          setEta(calculateETA(dist));
+          getRoadRoute(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+        }
+      } else {
+        console.log('⚠️ CUSTOMER: Invalid location data received');
       }
     });
 
     socket.on('provider:location', (data) => {
-      const newPos = [data.lat, data.lng];
-      setProviderLocation(newPos);
-      setRoute(prev => [...prev, newPos]);
+      console.log('📍 CUSTOMER: Provider location received:', JSON.stringify(data));
+      console.log('🔍 CUSTOMER: My trip ID:', actualTripId || id, 'Provider trip ID:', data.tripId);
+      if (data && data.lat && data.lng) {
+        console.log('✅ CUSTOMER: Setting provider location to:', data.lat, data.lng);
+        const newPos = [data.lat, data.lng];
+        setProviderLocation(newPos);
+        setRoute(prev => [...prev, newPos]);
+        setWaitingForProvider(false);
+        setProviderTimeout(false);
 
-      if (customerLocation) {
-        const dist = calculateDistance(data.lat, data.lng, customerLocation[0], customerLocation[1]);
-        setDistance(dist);
-        setEta(calculateETA(dist));
-        getRoadRoute(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+        if (customerLocation) {
+          const dist = calculateDistance(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+          setDistance(dist);
+          setEta(calculateETA(dist));
+          getRoadRoute(data.lat, data.lng, customerLocation[0], customerLocation[1]);
+        }
+      } else {
+        console.log('⚠️ CUSTOMER: Invalid provider location data received');
       }
     });
 
@@ -140,7 +209,18 @@ const CustomerView = ({ tripId }) => {
       socket.off('provider:location');
       socket.off('trip:ended');
     };
-  }, [socket, id, customerLocation]);
+  }, [socket, actualTripId, id, customerLocation]);
+
+  // Add timeout for provider location
+  useEffect(() => {
+    if (waitingForProvider && socket) {
+      const timeout = setTimeout(() => {
+        setProviderTimeout(true);
+      }, 30000); // 30 seconds timeout
+      
+      return () => clearTimeout(timeout);
+    }
+  }, [waitingForProvider, socket]);
 
   useEffect(() => {
     if (providerLocation) {
@@ -213,13 +293,78 @@ const CustomerView = ({ tripId }) => {
 
       {/* Map */}
       <div className="flex-1 relative" style={{ touchAction: 'pan-y' }}>
-        <TrackingMap
-          providerPos={providerLocation}
-          customerPos={customerLocation}
-          route={route}
-          roadRoute={roadRoute}
-          alternativeRoutes={alternativeRoutes}
-        />
+        {providerLocation ? (
+          <div style={{ height: '100%', width: '100%' }}>
+            <MapContainer
+              center={[providerLocation[0], providerLocation[1]]}
+              zoom={15}
+              style={{ height: '100%', width: '100%' }}
+            >
+              <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+
+              {alternativeRoutes.map((altRoute, index) => (
+                <Polyline
+                  key={index}
+                  positions={altRoute}
+                  color={index === selectedRouteIndex ? "#2563eb" : "#94a3b8"}
+                  weight={index === selectedRouteIndex ? 4 : 3}
+                  opacity={index === selectedRouteIndex ? 0.8 : 0.5}
+                  dashArray={index === selectedRouteIndex ? "" : "5, 10"}
+                  eventHandlers={{
+                    click: () => handleRouteSelect(index)
+                  }}
+                />
+              ))}
+
+              <Marker position={[providerLocation[0], providerLocation[1]]}>
+                <Popup>
+                  <div style={{ textAlign: 'center' }}>
+                    <strong>📍 Provider Location</strong><br />
+                    Lat: {providerLocation[0]}<br />
+                    Lng: {providerLocation[1]}<br />
+                    <span style={{ color: '#22c55e', fontSize: '12px' }}>• Live Tracking</span>
+                  </div>
+                </Popup>
+              </Marker>
+              {customerLocation && (
+                <Marker position={[customerLocation[0], customerLocation[1]]} icon={customerIcon}>
+                  <Popup>
+                    <div style={{ textAlign: 'center' }}>
+                      <strong>👤 Customer Location</strong><br />
+                      Lat: {customerLocation[0]}<br />
+                      Lng: {customerLocation[1]}<br />
+                      <span style={{ color: '#7c3aed', fontSize: '12px' }}>• Destination</span>
+                    </div>
+                  </Popup>
+                </Marker>
+              )}
+            </MapContainer>
+          </div>
+        ) : (
+          <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#f3f4f6' }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: '48px', marginBottom: '16px' }}>📍</div>
+              {providerTimeout ? (
+                <>
+                  <p style={{ color: '#dc2626', fontWeight: 'bold' }}>Provider not found</p>
+                  <p style={{ color: '#6b7280', fontSize: '14px', marginTop: '8px' }}>The service provider may not be online or tracking may not have started yet.</p>
+                  <button 
+                    onClick={() => window.location.reload()} 
+                    style={{ marginTop: '16px', padding: '8px 16px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
+                  >
+                    Refresh
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p style={{ color: '#6b7280' }}>Getting provider location...</p>
+                  <p style={{ color: '#9ca3af', fontSize: '12px', marginTop: '8px' }}>Trip ID: {id}</p>
+                  <p style={{ color: '#9ca3af', fontSize: '12px' }}>Socket: {socket ? '✅ Connected' : '❌ Disconnected'}</p>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Bottom Card */}
@@ -278,6 +423,24 @@ const CustomerView = ({ tripId }) => {
 
           {/* Cancel Button */}
           <div className='space-y-2'>
+            {/* Notes Section */}
+            <div className="mb-3">
+              <button
+                onClick={() => setShowNotes(!showNotes)}
+                className="w-full bg-gray-100 text-gray-700 font-medium py-2 px-3 rounded-lg text-sm flex items-center justify-center gap-2"
+              >
+                📝 {showNotes ? 'Hide Notes' : 'Add Notes'}
+              </button>
+              {showNotes && (
+                <textarea
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  placeholder="Add trip notes or special instructions..."
+                  className="w-full mt-2 p-3 border border-gray-300 rounded-lg text-sm resize-none"
+                  rows={3}
+                />
+              )}
+            </div>
             {/* <SendLocationButton /> */}
             {/* <button
               onClick={getMyaddress}
